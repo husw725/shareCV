@@ -1,3 +1,8 @@
+import socket
+import threading
+import time
+
+# ... (rest of imports)
 from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import JSONResponse, FileResponse
 import pyperclip
@@ -8,6 +13,27 @@ import sys
 import subprocess
 
 app = FastAPI()
+
+# Discovery settings
+DISCOVERY_PORT = 6098
+DISCOVERY_MESSAGE = b"ShareCV-Server:6097"
+
+def udp_broadcaster():
+    """Broadcast server presence for auto-discovery"""
+    broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    
+    print(f"📡 Discovery broadcaster started on port {DISCOVERY_PORT}...")
+    while True:
+        try:
+            # Broadcast to the entire local network
+            broadcast_sock.sendto(DISCOVERY_MESSAGE, ('<broadcast>', DISCOVERY_PORT))
+        except Exception as e:
+            print(f"[⚠️] Broadcast error: {e}")
+        time.sleep(5)
+
+# ... (get_local_clipboard, set_local_clipboard, and endpoints stay the same)
+
 
 # Global state to track clipboard content
 # type: "text" | "file"
@@ -170,6 +196,9 @@ async def download_file(filename: str):
     return JSONResponse({"error": "File not found"}, status_code=404)
 
 if __name__ == "__main__":
+    # Start the discovery broadcaster in a background thread
+    threading.Thread(target=udp_broadcaster, daemon=True).start()
+
     # Run Uvicorn with a single worker, no reload, minimal threads
     uvicorn.run(
         "server:app",

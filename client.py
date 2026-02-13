@@ -5,12 +5,45 @@ import sys
 import subprocess
 import os
 import shutil
+import socket
 
-SERVER = "http://10.0.6.136:6097"  # change to your server IP
+# Discovery settings
+DISCOVERY_PORT = 6098
+DISCOVERY_MESSAGE = b"ShareCV-Server:6097"
+
+SERVER = "http://10.0.6.136:6097"  # fallback server IP
 POLL_INTERVAL = 2.0  # seconds between checks
 DOWNLOAD_DIR = "client_downloads"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+def discover_server():
+    """Listen for UDP broadcast from the server"""
+    print(f"🔍 Searching for ShareCV server on local network...")
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sys.platform != "win32":
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except AttributeError:
+            pass
+    
+    try:
+        sock.bind(('', DISCOVERY_PORT))
+        sock.settimeout(5.0) # Search for 5 seconds
+        data, addr = sock.recvfrom(1024)
+        if data == DISCOVERY_MESSAGE:
+            server_ip = addr[0]
+            server_port = data.decode().split(":")[1]
+            server_url = f"http://{server_ip}:{server_port}"
+            print(f"✅ Found server at {server_url}")
+            return server_url
+    except Exception as e:
+        print(f"❌ Discovery failed or timed out: {e}")
+    finally:
+        sock.close()
+    return None
 
 def get_local_clipboard():
     """Get current clipboard content (text or file path)"""
@@ -69,13 +102,13 @@ def set_local_clipboard(data):
             except Exception as e:
                 print(f"[⚠️] Failed to set Windows file clipboard: {e}")
 
-async def sync_clipboard():
+async def sync_clipboard(server_url):
     last_local = {"type": "text", "content": ""}
     last_remote = {"type": "text", "content": ""}
     last_action = None  # "sent" or "received"
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        print(f"🔗 Connected to {SERVER} — syncing every {POLL_INTERVAL}s (Ctrl+C to stop)\n")
+        print(f"🔗 Connected to {server_url} — syncing every {POLL_INTERVAL}s (Ctrl+C to stop)\n")
 
         while True:
             try:
@@ -84,10 +117,10 @@ async def sync_clipboard():
 
                 # 2️⃣ Get remote clipboard state
                 try:
-                    resp = await client.get(f"{SERVER}/get")
+                    resp = await client.get(f"{server_url}/get")
                     remote_state = resp.json()
                 except Exception as e:
-                    print(f"[⚠️] Server error: {e}")
+                    print(f"[⚠️] Server connection lost: {e}")
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
@@ -118,7 +151,7 @@ async def sync_clipboard():
                             # Maybe not, just overwrite to be safe or skip if exists?
                             # Let's download.
                             print(f"[⬇️] Downloading file: {filename}...")
-                            async with client.stream("GET", f"{SERVER}/download/{filename}") as resp:
+                            async with client.stream("GET", f"{server_url}/download/{filename}") as resp:
                                 if resp.status_code == 200:
                                     with open(local_path, "wb") as f:
                                         async for chunk in resp.aiter_bytes():
@@ -153,7 +186,7 @@ async def sync_clipboard():
                             print(f"[⬆️] Uploading file: {filename}...")
                             with open(file_path, "rb") as f:
                                 files = {"file": (filename, f)}
-                                await client.post(f"{SERVER}/upload", files=files)
+                                await client.post(f"{server_url}/upload", files=files)
                             # Update server state is handled by upload? 
                             # Our server code updates state on upload.
                             # So we don't need to call /set for files if /upload does it.
@@ -162,7 +195,7 @@ async def sync_clipboard():
                             print(f"[⚠️] File not found: {file_path}")
                     else:
                         # Send text
-                        await client.post(f"{SERVER}/set", json=current_local)
+                        await client.post(f"{server_url}/set", json=current_local)
                     
                     last_local = current_local
                     last_remote = current_local # Assume server matches now
@@ -178,6 +211,14 @@ async def sync_clipboard():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(sync_clipboard())
+        # 1. Try to discover server automatically
+        server_url = discover_server()
+        
+        # 2. If discovery failed, use the fallback
+        if not server_url:
+            print(f"⚠️ Falling back to manual server: {SERVER}")
+            server_url = SERVER
+            
+        asyncio.run(sync_clipboard(server_url))
     except KeyboardInterrupt:
         print("\n🛑 Stopped clipboard sync.")

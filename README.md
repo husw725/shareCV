@@ -4,6 +4,7 @@ ShareCV is a lightweight tool that synchronizes your clipboard (both text and fi
 
 ## Features
 
+-   **Automatic Discovery:** No need to type IP addresses. The client automatically finds the server on your local network.
 -   **Text Sharing:** Copy text on one computer, paste it on another.
 -   **File Sharing:** Copy files in Finder (macOS) or File Explorer (Windows), and paste them on the other machine.
 -   **Cross-Platform:** Works bi-directionally between macOS and Windows.
@@ -38,21 +39,6 @@ pip install -r requirements-c.txt
 
 ---
 
-## Configuration
-
-1.  **Find the Server's IP Address:**
-    *   **Windows:** Open Command Prompt and run `ipconfig`. Look for "IPv4 Address".
-    *   **macOS:** Open Terminal and run `ifconfig | grep "inet " | grep -v 127.0.0.1`.
-
-2.  **Update the Client:**
-    *   Open `client.py` on the **Client Machine**.
-    *   Change the `SERVER` variable to match your Server's IP address:
-        ```python
-        SERVER = "http://192.168.1.5:6097"  # Replace with your Server's IP
-        ```
-
----
-
 ## Usage
 
 ### Step 1: Start the Server
@@ -61,7 +47,7 @@ On the **Server Machine**, run:
 ```bash
 python server.py
 ```
-*   The server will start listening on port `6097`.
+*   The server will start listening on port `6097` and begin broadcasting its presence on the local network.
 *   It also acts as a client for this machine, monitoring the local clipboard.
 
 ### Step 2: Start the Client
@@ -70,7 +56,8 @@ On the **Client Machine**, run:
 ```bash
 python client.py
 ```
-*   The client will connect to the server and start syncing.
+*   The client will automatically search for and connect to the server.
+*   **Manual Fallback:** If auto-discovery fails (due to network/firewall settings), it will fall back to the IP address defined in `client.py`.
 
 ### Step 3: Share!
 
@@ -78,14 +65,14 @@ python client.py
 *   **Copy Files:**
     *   **macOS:** Select a file in Finder and press `Cmd+C`.
     *   **Windows:** Select a file in Explorer and press `Ctrl+C`.
-    *   Wait a moment for the transfer (large files take longer).
     *   **Paste:** Press `Cmd+V` (macOS) or `Ctrl+V` (Windows) on the destination computer to paste the file.
 
 ---
 
 ## Technical Details
 
--   **Server (`server.py`):** Uses `FastAPI` to handle HTTP requests. It manages the central clipboard state and stores transferred files in a `downloads/` directory. It also monitors the server's local clipboard changes.
+-   **Auto-Discovery:** Uses UDP broadcasting on port `6098` to allow the client to find the server's IP automatically.
+-   **Server (`server.py`):** Uses `FastAPI` to handle HTTP requests. It manages the central clipboard state and stores transferred files in a `downloads/` directory.
 -   **Client (`client.py`):** Polls the server for changes and pushes local clipboard updates.
 -   **File Handling:**
     -   **macOS:** Uses `osascript` (AppleScript) to read/write file paths to the system clipboard.
