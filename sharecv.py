@@ -38,14 +38,27 @@ def discover_server(timeout=2.0):
         except AttributeError:
             pass
     
+    # Multicast setup
+    MULTICAST_GROUP = '239.255.255.250'
+
     try:
         sock.bind(('', DISCOVERY_PORT))
+
+        # Join multicast group
+        try:
+            group = socket.inet_aton(MULTICAST_GROUP)
+            mreq = group + socket.inet_aton('0.0.0.0')
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except Exception:
+            pass
+
         sock.settimeout(timeout)
         data, addr = sock.recvfrom(1024)
         if data == DISCOVERY_MESSAGE:
             server_ip = addr[0]
             server_port = data.decode().split(":")[1]
             server_url = f"http://{server_ip}:{server_port}"
+            print(f"✅ Found server at {server_url}")
             return server_url
     except Exception:
         pass
@@ -54,14 +67,33 @@ def discover_server(timeout=2.0):
     return None
 
 def udp_broadcaster():
-    """Broadcast server presence for auto-discovery"""
+    """Broadcast server presence for auto-discovery across all interfaces"""
     broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    # Multicast setup
+    MULTICAST_GROUP = '239.255.255.250'
+    broadcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
     
     print(f"📡 Discovery broadcaster started on port {DISCOVERY_PORT}...")
     while True:
         try:
+            # 1. Standard Global Broadcast
             broadcast_sock.sendto(DISCOVERY_MESSAGE, ('<broadcast>', DISCOVERY_PORT))
+            
+            # 2. SSDP/Multicast (often passes through VPNs better than broadcast)
+            broadcast_sock.sendto(DISCOVERY_MESSAGE, (MULTICAST_GROUP, DISCOVERY_PORT))
+            
+            # 3. Subnet-specific broadcasts for all local IPs
+            try:
+                hostname = socket.gethostname()
+                for ip in socket.gethostbyname_ex(hostname)[2]:
+                    if ip.startswith("127."): continue
+                    # Rough guess for subnet broadcast (e.g., 10.0.6.255)
+                    subnet = ".".join(ip.split(".")[:-1]) + ".255"
+                    broadcast_sock.sendto(DISCOVERY_MESSAGE, (subnet, DISCOVERY_PORT))
+            except Exception:
+                pass
+
         except Exception as e:
             pass
         time.sleep(1)
