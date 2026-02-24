@@ -330,6 +330,33 @@ async def sync_clipboard(server_url):
 
             await asyncio.sleep(POLL_INTERVAL)
 
+CACHE_FILE = ".sharecv_cache"
+
+def save_cache(url):
+    try:
+        with open(CACHE_FILE, "w") as f:
+            f.write(url)
+    except Exception:
+        pass
+
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r") as f:
+                return f.read().strip()
+        except Exception:
+            pass
+    return None
+
+async def check_server(url):
+    """Quick check if a server is alive"""
+    try:
+        async with httpx.AsyncClient(timeout=1.0) as client:
+            resp = await client.get(f"{url}/get")
+            return resp.status_code == 200
+    except Exception:
+        return False
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ShareCV - Cross-Platform Clipboard Synchronization")
     parser.add_argument("server", nargs="?", default=None, help="Optional IP address or URL of the server to connect to directly (bypasses auto-discovery)")
@@ -346,9 +373,19 @@ if __name__ == "__main__":
     else:
         print("🔍 Looking for existing ShareCV server on local network...")
         found_server_url = discover_server(timeout=2.0)
+        
+        # Smart Memory Fallback
+        if not found_server_url:
+            cached_url = load_cache()
+            if cached_url:
+                print(f"⌛ Discovery failed, trying cached server: {cached_url}...")
+                if asyncio.run(check_server(cached_url)):
+                    print(f"✨ Cached server is alive!")
+                    found_server_url = cached_url
     
     if found_server_url:
         print(f"✅ Running in CLIENT mode connected to {found_server_url}")
+        save_cache(found_server_url)
         try:
             asyncio.run(sync_clipboard(found_server_url))
         except KeyboardInterrupt:
