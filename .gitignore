@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*$py.class
+client_downloads/
+sharecv_downloads/
+downloads/
+.DS_Store
