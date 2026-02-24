@@ -177,8 +177,32 @@ pb's writeObjects:{{theURL}}'''
         
         elif sys.platform == "win32":
             try:
-                cmd = ["powershell.exe", "-NoProfile", "-Command", f'Set-Clipboard -Path "{abs_path}"']
-                subprocess.run(cmd)
+                ext = abs_path.lower().split('.')[-1]
+                if ext in ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff']:
+                    safe_path = abs_path.replace("'", "''")
+                    ps_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$data = New-Object System.Windows.Forms.DataObject
+$files = New-Object System.Collections.Specialized.StringCollection
+$files.Add('{safe_path}')
+$data.SetFileDropList($files)
+try {{
+    $bmp = New-Object System.Drawing.Bitmap('{safe_path}')
+    $data.SetImage($bmp)
+    [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+    $bmp.Dispose()
+}} catch {{
+    [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)
+}}
+"""
+                    import base64
+                    encoded = base64.b64encode(ps_script.encode('utf-16le')).decode('utf-8')
+                    cmd = ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded]
+                    subprocess.run(cmd)
+                else:
+                    cmd = ["powershell.exe", "-NoProfile", "-Command", f'Set-Clipboard -Path "{abs_path}"']
+                    subprocess.run(cmd)
             except Exception as e:
                 print(f"[⚠️] Failed to set Windows file clipboard: {e}")
 
