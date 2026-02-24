@@ -102,9 +102,16 @@ def get_local_clipboard():
     """Get current clipboard content (text or file path)"""
     if sys.platform == "darwin":
         try:
-            script = 'tell application "System Events" to return POSIX path of (the clipboard as alias)'
+            script = '''try
+    set p to the clipboard as record
+    return POSIX path of ((«class furl» of p) as text)
+on error
+    try
+        tell application "System Events" to return POSIX path of (the clipboard as alias)
+    end try
+end try'''
             result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-            if result.returncode == 0:
+            if result.returncode == 0 and result.stdout.strip():
                 path = result.stdout.strip()
                 if os.path.exists(path):
                     return {"type": "file", "content": path}
@@ -112,7 +119,15 @@ def get_local_clipboard():
             pass
             
         try:
-            script_check = 'if ((clipboard info) as string) contains "PNGf" then \n return "PNGf" \n else if ((clipboard info) as string) contains "TIFF picture" then \n return "TIFF" \n end if \n return "no"'
+            script_check = '''set infoStr to (clipboard info) as string
+if infoStr contains "«class furl»" or infoStr contains "public.file-url" then
+    return "no"
+else if infoStr contains "PNGf" then
+    return "PNGf"
+else if infoStr contains "TIFF picture" then
+    return "TIFF"
+end if
+return "no"'''
             res_check = subprocess.run(["osascript", "-e", script_check], capture_output=True, text=True)
             img_type = res_check.stdout.strip()
             if img_type in ["PNGf", "TIFF"]:

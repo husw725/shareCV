@@ -5,3 +5,4 @@ client_downloads/
 sharecv_downloads/
 downloads/
 .DS_Store
+.sharecv_cache
