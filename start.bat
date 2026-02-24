@@ -14,7 +14,7 @@ if %errorlevel% neq 0 (
 )
 
 :: Run ShareCV
-python sharecv.py
+python sharecv.py %*
 if %errorlevel% neq 0 (
     echo.
     echo [ERROR] ShareCV exited with an error.

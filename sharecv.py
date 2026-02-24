@@ -2,6 +2,7 @@ import asyncio
 import httpx
 import pyperclip
 import sys
+import argparse
 import subprocess
 import os
 import shutil
@@ -298,11 +299,24 @@ async def sync_clipboard(server_url):
             await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    print("🔍 Looking for existing ShareCV server on local network...")
-    found_server_url = discover_server(timeout=2.0)
+    parser = argparse.ArgumentParser(description="ShareCV - Cross-Platform Clipboard Synchronization")
+    parser.add_argument("server", nargs="?", default=None, help="Optional IP address or URL of the server to connect to directly (bypasses auto-discovery)")
+    args = parser.parse_args()
+
+    found_server_url = None
+
+    if args.server:
+        if not args.server.startswith("http://"):
+            found_server_url = f"http://{args.server}:{SERVER_PORT}"
+        else:
+            found_server_url = args.server
+        print(f"✅ Manual server URL provided. Connecting directly...")
+    else:
+        print("🔍 Looking for existing ShareCV server on local network...")
+        found_server_url = discover_server(timeout=2.0)
     
     if found_server_url:
-        print(f"✅ Found server! Running in CLIENT mode connected to {found_server_url}")
+        print(f"✅ Running in CLIENT mode connected to {found_server_url}")
         try:
             asyncio.run(sync_clipboard(found_server_url))
         except KeyboardInterrupt:

@@ -52,6 +52,10 @@ On your other machine, run:
 python sharecv.py
 ```
 *   It will automatically discover the server running on the first machine and start in **Client mode**.
+*   **Manual Fallback:** If your computers are on different subnets (e.g., VMs, VPNs) and auto-discovery fails, you can connect directly by providing the server's IP address:
+    ```bash
+    python sharecv.py 10.0.6.136
+    ```
 
 ### Step 3: Share!
 

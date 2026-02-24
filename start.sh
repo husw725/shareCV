@@ -17,4 +17,4 @@ then
 fi
 
 # Run ShareCV
-python3 sharecv.py
+python3 sharecv.py "$@"
