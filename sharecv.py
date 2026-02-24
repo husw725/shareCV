@@ -112,12 +112,19 @@ def get_local_clipboard():
             pass
             
         try:
-            script_check = 'if ((clipboard info) as string) contains "PNGf" then return "yes"'
+            script_check = 'if ((clipboard info) as string) contains "PNGf" then \n return "PNGf" \n else if ((clipboard info) as string) contains "TIFF picture" then \n return "TIFF" \n end if \n return "no"'
             res_check = subprocess.run(["osascript", "-e", script_check], capture_output=True, text=True)
-            if "yes" in res_check.stdout:
+            img_type = res_check.stdout.strip()
+            if img_type in ["PNGf", "TIFF"]:
                 img_path = "/tmp/sharecv_mac_temp.png"
-                extract_cmd = f"osascript -e 'the clipboard as \\\"PNGf\\\"' | sed -e 's/«data PNGf//' -e 's/»//' | xxd -r -p > {img_path}"
-                subprocess.run(extract_cmd, shell=True)
+                if img_type == "PNGf":
+                    extract_cmd = f"osascript -e 'the clipboard as \"PNGf\"' | sed -e 's/«data PNGf//' -e 's/»//' | xxd -r -p > {img_path}"
+                    subprocess.run(extract_cmd, shell=True)
+                else:
+                    tiff_path = "/tmp/sharecv_mac_temp.tiff"
+                    extract_cmd = f"osascript -e 'the clipboard as \"TIFF\"' | sed -e 's/«data TIFF//' -e 's/»//' | xxd -r -p > {tiff_path} && sips -s format png {tiff_path} --out {img_path}"
+                    subprocess.run(extract_cmd, shell=True)
+
                 if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
                     import hashlib
                     with open(img_path, "rb") as f:
@@ -187,6 +194,9 @@ $data = New-Object System.Windows.Forms.DataObject
 $files = New-Object System.Collections.Specialized.StringCollection
 $files.Add('{safe_path}')
 $data.SetFileDropList($files)
+$dropEffect = New-Object byte[] 4
+$dropEffect[0] = 5
+$data.SetData("Preferred DropEffect", [System.IO.MemoryStream]::new($dropEffect))
 try {{
     $bmp = New-Object System.Drawing.Bitmap('{safe_path}')
     $data.SetImage($bmp)
