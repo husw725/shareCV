@@ -27,37 +27,31 @@ cd shareCV
 
 ### 2. Install Dependencies
 
-**On the Server Machine (the main hub):**
+**On both machines:**
 ```bash
-pip install -r requirements-s.txt
-```
-
-**On the Client Machine:**
-```bash
-pip install -r requirements-c.txt
+pip install -r requirements.txt
 ```
 
 ---
 
 ## Usage
 
-### Step 1: Start the Server
+### Step 1: Start on the First Machine (becomes the Server)
 
-On the **Server Machine**, run:
+On your primary machine, run:
 ```bash
-python server.py
+python sharecv.py
 ```
-*   The server will start listening on port `6097` and begin broadcasting its presence on the local network.
-*   It also acts as a client for this machine, monitoring the local clipboard.
+*   Since no other instance is running, it will automatically start in **Server mode** (listening on port `6097`).
+*   It acts as the central hub while also monitoring this machine's local clipboard.
 
-### Step 2: Start the Client
+### Step 2: Start on the Second Machine (becomes the Client)
 
-On the **Client Machine**, run:
+On your other machine, run:
 ```bash
-python client.py
+python sharecv.py
 ```
-*   The client will automatically search for and connect to the server.
-*   **Manual Fallback:** If auto-discovery fails (due to network/firewall settings), it will fall back to the IP address defined in `client.py`.
+*   It will automatically discover the server running on the first machine and start in **Client mode**.
 
 ### Step 3: Share!
 
@@ -72,8 +66,8 @@ python client.py
 ## Technical Details
 
 -   **Auto-Discovery:** Uses UDP broadcasting on port `6098` to allow the client to find the server's IP automatically.
--   **Server (`server.py`):** Uses `FastAPI` to handle HTTP requests. It manages the central clipboard state and stores transferred files in a `downloads/` directory.
--   **Client (`client.py`):** Polls the server for changes and pushes local clipboard updates.
+-   **Server Mode (`sharecv.py`):** Uses `FastAPI` to handle HTTP requests. It manages the central clipboard state and stores transferred files in a `sharecv_downloads/` directory.
+-   **Client Mode (`sharecv.py`):** Polls the server for changes and pushes local clipboard updates.
 -   **File Handling:**
     -   **macOS:** Uses `osascript` (AppleScript) to read/write file paths to the system clipboard.
     -   **Windows:** Uses PowerShell (`Get-Clipboard`, `Set-Clipboard`) to interact with the file clipboard.
