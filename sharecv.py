@@ -27,7 +27,7 @@ clipboard_state = {"type": "text", "content": ""}
 
 # ================= HELPER FUNCTIONS =================
 
-def discover_server(timeout=3.0):
+def discover_server(timeout=2.0):
     """Listen for UDP broadcast from the server"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -63,7 +63,7 @@ def udp_broadcaster():
             broadcast_sock.sendto(DISCOVERY_MESSAGE, ('<broadcast>', DISCOVERY_PORT))
         except Exception as e:
             pass
-        time.sleep(5)
+        time.sleep(1)
 
 def get_local_clipboard():
     """Get current clipboard content (text or file path)"""
@@ -299,7 +299,7 @@ async def sync_clipboard(server_url):
 
 if __name__ == "__main__":
     print("🔍 Looking for existing ShareCV server on local network...")
-    found_server_url = discover_server(timeout=3.0)
+    found_server_url = discover_server(timeout=2.0)
     
     if found_server_url:
         print(f"✅ Found server! Running in CLIENT mode connected to {found_server_url}")
