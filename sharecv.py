@@ -18,7 +18,12 @@ DISCOVERY_PORT = 6098
 DISCOVERY_MESSAGE = b"ShareCV-Server:6097"
 SERVER_PORT = 6097
 POLL_INTERVAL = 2.0
-DOWNLOAD_DIR = "sharecv_downloads"
+
+if sys.platform == "darwin":
+    # Use /tmp/ShareCV on macOS to ensure sandboxed apps (DingTalk, WeChat) can read the files.
+    DOWNLOAD_DIR = "/tmp/ShareCV"
+else:
+    DOWNLOAD_DIR = "sharecv_downloads"
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -179,9 +184,12 @@ def set_local_clipboard(data):
 
         if sys.platform == "darwin":
             try:
+                # Use a more complete AppleScript to set both NSURL and NSFilenamesPboardType
+                # This ensures compatibility with both modern and older apps (including sandboxed ones).
+                safe_path = abs_path.replace('"', '\\"')
                 script = f'''use framework "AppKit"
 use scripting additions
-set theURL to current application's NSURL's fileURLWithPath:"{abs_path}"
+set theURL to current application's NSURL's fileURLWithPath:"{safe_path}"
 set pb to current application's NSPasteboard's generalPasteboard()
 pb's clearContents()
 set theExt to theURL's pathExtension()'s lowercaseString() as string
@@ -189,10 +197,14 @@ if theExt is in {{"png", "jpg", "jpeg", "tiff", "gif", "bmp"}} then
     set theImage to current application's NSImage's alloc()'s initWithContentsOfURL:theURL
     if theImage is not missing value then
         pb's writeObjects:{{theImage, theURL}}
+        -- Also set the filenames type for broader compatibility
+        pb's setPropertyList:{{ "{safe_path}" }} forType:(current application's NSFilenamesPboardType)
         return
     end if
 end if
-pb's writeObjects:{{theURL}}'''
+pb's writeObjects:{{theURL}}
+pb's setPropertyList:{{ "{safe_path}" }} forType:(current application's NSFilenamesPboardType)
+'''
                 subprocess.run(["osascript", "-e", script])
             except Exception as e:
                 print(f"[⚠️] Failed to set macOS file clipboard: {e}")
