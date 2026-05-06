@@ -184,28 +184,29 @@ def set_local_clipboard(data):
 
         if sys.platform == "darwin":
             try:
-                # Use a more complete AppleScript to set both NSURL and NSFilenamesPboardType
-                # This ensures compatibility with both modern and older apps (including sandboxed ones).
-                safe_path = abs_path.replace('"', '\\"')
-                script = f'''use framework "AppKit"
-use scripting additions
-set theURL to current application's NSURL's fileURLWithPath:"{safe_path}"
-set pb to current application's NSPasteboard's generalPasteboard()
-pb's clearContents()
-set theExt to theURL's pathExtension()'s lowercaseString() as string
-if theExt is in {{"png", "jpg", "jpeg", "tiff", "gif", "bmp"}} then
-    set theImage to current application's NSImage's alloc()'s initWithContentsOfURL:theURL
-    if theImage is not missing value then
-        pb's writeObjects:{{theImage, theURL}}
-        -- Also set the filenames type for broader compatibility
-        pb's setPropertyList:{{ "{safe_path}" }} forType:(current application's NSFilenamesPboardType)
-        return
-    end if
-end if
-pb's writeObjects:{{theURL}}
-pb's setPropertyList:{{ "{safe_path}" }} forType:(current application's NSFilenamesPboardType)
-'''
-                subprocess.run(["osascript", "-e", script])
+                from AppKit import NSPasteboard, NSURL, NSFilenamesPboardType, NSImage
+                
+                path = os.path.abspath(abs_path)
+                pb = NSPasteboard.generalPasteboard()
+                pb.clearContents()
+                
+                # Check for image types for direct NSImage handling
+                ext = path.lower().split('.')[-1]
+                if ext in ['png', 'jpg', 'jpeg', 'tiff', 'gif', 'bmp']:
+                    # Create NSImage from the file data directly
+                    img = NSImage.alloc().initByReferencingFile_(path)
+                    if img:
+                        # Write the image directly to the pasteboard
+                        pb.writeObjects_([img])
+                        print(f"[✅] Successfully set clipboard via NSImage object: {path}")
+                        return
+                
+                # Fallback for non-images or if NSImage creation failed
+                url = NSURL.fileURLWithPath_(path)
+                pb.writeObjects_([url])
+                pb.setPropertyList_forType_([path], NSFilenamesPboardType)
+                print(f"[✅] Successfully set clipboard via file URL: {path}")
+                
             except Exception as e:
                 print(f"[⚠️] Failed to set macOS file clipboard: {e}")
         
