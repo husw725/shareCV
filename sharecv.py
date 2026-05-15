@@ -321,7 +321,7 @@ async def sync_clipboard(server_url):
 
         while True:
             try:
-                current_local = get_local_clipboard()
+                current_local = await asyncio.to_thread(get_local_clipboard)
 
                 try:
                     resp = await client.get(f"{server_url}/get")
@@ -350,15 +350,15 @@ async def sync_clipboard(server_url):
                                     with open(local_path, "wb") as f:
                                         async for chunk in resp.aiter_bytes():
                                             f.write(chunk)
-                                    set_local_clipboard({"type": "file", "content": local_path})
+                                    await asyncio.to_thread(set_local_clipboard, {"type": "file", "content": local_path})
                                     print(f"[✅] File downloaded and copied: {local_path}")
                                 else:
                                     print(f"[❌] Failed to download: {resp.status_code}")
                         else:
-                            set_local_clipboard(remote_state)
+                            await asyncio.to_thread(set_local_clipboard, remote_state)
                             print(f"[⬇️] Updated local text.")
 
-                        last_local = get_local_clipboard()
+                        last_local = await asyncio.to_thread(get_local_clipboard)
                         last_remote = remote_state
                         last_action = "received"
                         await asyncio.sleep(POLL_INTERVAL)
