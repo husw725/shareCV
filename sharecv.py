@@ -103,9 +103,23 @@ def udp_broadcaster():
             pass
         time.sleep(1)
 
+last_change_count = 0
+last_clipboard_data = {"type": "text", "content": ""}
+
 def get_local_clipboard():
+    global last_change_count, last_clipboard_data
     """Get current clipboard content (text or file path)"""
     if sys.platform == "darwin":
+        try:
+            from AppKit import NSPasteboard
+            pb = NSPasteboard.generalPasteboard()
+            current_count = pb.changeCount()
+            if current_count == last_change_count:
+                return last_clipboard_data
+            last_change_count = current_count
+        except Exception:
+            pass
+
         try:
             script = '''try
     set p to the clipboard as record
@@ -119,7 +133,8 @@ end try'''
             if result.returncode == 0 and result.stdout.strip():
                 path = result.stdout.strip()
                 if os.path.exists(path):
-                    return {"type": "file", "content": path}
+                    last_clipboard_data = {"type": "file", "content": path}
+                    return last_clipboard_data
         except Exception:
             pass
             
@@ -154,7 +169,8 @@ return "no"'''
                         shutil.move(img_path, final_path)
                     else:
                         os.remove(img_path)
-                    return {"type": "file", "content": final_path}
+                    last_clipboard_data = {"type": "file", "content": final_path}
+                    return last_clipboard_data
         except Exception:
             pass
             
@@ -170,7 +186,9 @@ return "no"'''
             pass
 
     text = pyperclip.paste() or ""
-    return {"type": "text", "content": text}
+    last_clipboard_data = {"type": "text", "content": text}
+    return last_clipboard_data
+
 
 def set_local_clipboard(data):
     """Set clipboard content"""
