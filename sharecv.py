@@ -368,6 +368,8 @@ async def sync_clipboard(server_url):
                                     with open(local_path, "wb") as f:
                                         async for chunk in resp.aiter_bytes():
                                             f.write(chunk)
+                                        f.flush()
+                                        os.fsync(f.fileno())
                                     await asyncio.to_thread(set_local_clipboard, {"type": "file", "content": local_path})
                                     print(f"[✅] File downloaded and copied: {local_path}")
                                 else:
