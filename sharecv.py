@@ -229,10 +229,10 @@ def set_local_clipboard(data):
                         last_change_count = pb.changeCount()
                         return
                 
-                # Fallback for non-images using AppleScript which is safer for Finder
-                script = f'set the clipboard to (POSIX file "{path}")'
-                subprocess.run(["osascript", "-e", script])
-                print(f"[✅] Successfully set clipboard via AppleScript: {path}")
+                # Fallback for non-images using pure AppKit NSURL (provides sandbox extensions for WeChat)
+                url = NSURL.fileURLWithPath_(path)
+                pb.writeObjects_([url])
+                print(f"[✅] Successfully set clipboard via AppKit NSURL: {path}")
                 last_clipboard_data = {"type": "file", "content": path}
                 last_change_count = pb.changeCount()
                 
