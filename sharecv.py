@@ -191,9 +191,17 @@ return "no"'''
 
 
 def set_local_clipboard(data):
+    global last_change_count, last_clipboard_data
     """Set clipboard content"""
     if data["type"] == "text":
         pyperclip.copy(data["content"])
+        last_clipboard_data = {"type": "text", "content": data["content"]}
+        if sys.platform == "darwin":
+            try:
+                from AppKit import NSPasteboard
+                last_change_count = NSPasteboard.generalPasteboard().changeCount()
+            except: pass
+
     elif data["type"] == "file":
         abs_path = os.path.abspath(data["content"])
         if not os.path.exists(abs_path):
@@ -202,7 +210,7 @@ def set_local_clipboard(data):
 
         if sys.platform == "darwin":
             try:
-                from AppKit import NSPasteboard, NSURL, NSFilenamesPboardType, NSImage
+                from AppKit import NSPasteboard, NSURL, NSImage
                 
                 path = os.path.abspath(abs_path)
                 pb = NSPasteboard.generalPasteboard()
@@ -217,13 +225,16 @@ def set_local_clipboard(data):
                         # Write the image directly to the pasteboard
                         pb.writeObjects_([img])
                         print(f"[✅] Successfully set clipboard via NSImage object: {path}")
+                        last_clipboard_data = {"type": "file", "content": path}
+                        last_change_count = pb.changeCount()
                         return
                 
-                # Fallback for non-images or if NSImage creation failed
-                url = NSURL.fileURLWithPath_(path)
-                pb.writeObjects_([url])
-                pb.setPropertyList_forType_([path], NSFilenamesPboardType)
-                print(f"[✅] Successfully set clipboard via file URL: {path}")
+                # Fallback for non-images using AppleScript which is safer for Finder
+                script = f'set the clipboard to (POSIX file "{path}")'
+                subprocess.run(["osascript", "-e", script])
+                print(f"[✅] Successfully set clipboard via AppleScript: {path}")
+                last_clipboard_data = {"type": "file", "content": path}
+                last_change_count = pb.changeCount()
                 
             except Exception as e:
                 print(f"[⚠️] Failed to set macOS file clipboard: {e}")
