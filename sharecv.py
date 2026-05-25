@@ -229,12 +229,22 @@ def set_local_clipboard(data):
                         last_change_count = pb.changeCount()
                         return
                 
-                # Fallback for non-images using pure AppKit NSURL (provides sandbox extensions for WeChat)
-                url = NSURL.fileURLWithPath_(path)
-                pb.writeObjects_([url])
-                print(f"[✅] Successfully set clipboard via AppKit NSURL: {path}")
+                # Fallback for non-images: Spawn a separate short-lived Python process to write the AppKit NSURL.
+                # This ensures the main asyncio process doesn't get blocked by macOS pasteboard IPC
+                # when other apps (like Finder or WeChat) try to read the data lazily.
+                py_script = f"""
+import sys
+from AppKit import NSPasteboard, NSURL
+pb = NSPasteboard.generalPasteboard()
+pb.clearContents()
+url = NSURL.fileURLWithPath_(r"{path}")
+pb.writeObjects_([url])
+                """
+                subprocess.run([sys.executable, "-c", py_script])
+                print(f"[✅] Successfully set clipboard via AppKit subprocess: {path}")
                 last_clipboard_data = {"type": "file", "content": path}
-                last_change_count = pb.changeCount()
+                from AppKit import NSPasteboard
+                last_change_count = NSPasteboard.generalPasteboard().changeCount()
                 
             except Exception as e:
                 print(f"[⚠️] Failed to set macOS file clipboard: {e}")
