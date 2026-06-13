@@ -715,14 +715,23 @@ async def run_client(server_url: str):
 
                     recv = asyncio.create_task(recv_loop(ws, client, server_url, local, seen))
                     send = asyncio.create_task(send_loop(ws, client, server_url, outq))
-                    done, pending = await asyncio.wait(
-                        [recv, send], return_when=asyncio.FIRST_COMPLETED)
-                    for t in pending:
-                        t.cancel()
+                    tasks = [recv, send]
+                    try:
+                        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        # Surface why a loop ended (e.g. WinError 121 socket timeout) so the
+                        # outer handler can reconnect, instead of asyncio dumping a raw traceback.
+                        for t in done:
+                            if t.exception() is not None:
+                                raise t.exception()
+                    finally:
+                        for t in tasks:
+                            t.cancel()
+                        # Drain both tasks so no "Task exception was never retrieved" noise.
+                        await asyncio.gather(*tasks, return_exceptions=True)
             except (ConnectionClosed, OSError, ConnectionError) as e:
-                print(f"[!] Connection lost ({type(e).__name__}); reconnecting in {RECONNECT_DELAY}s...")
+                print(f"[!] Connection lost ({type(e).__name__}: {e}); reconnecting in {RECONNECT_DELAY}s...")
             except Exception as e:
-                print(f"[!] Client error: {type(e).__name__}: {e}; reconnecting...")
+                print(f"[!] Client error: {type(e).__name__}: {e}; reconnecting in {RECONNECT_DELAY}s...")
             finally:
                 if monitor:
                     monitor.stop()
