@@ -16,5 +16,16 @@ then
     exit 1
 fi
 
+# Auto-install dependencies if anything is missing (also covers requirement changes)
+DEPS_CHECK="import websockets, fastapi, httpx, uvicorn, pyperclip"
+if [ "$(uname)" = "Darwin" ]; then
+    DEPS_CHECK="$DEPS_CHECK, AppKit"
+fi
+if ! python3 -c "$DEPS_CHECK" >/dev/null 2>&1; then
+    echo "[*] Installing dependencies (this only runs when something is missing)..."
+    python3 -m pip install -r requirements.txt
+    echo ""
+fi
+
 # Run ShareCV
 python3 sharecv.py "$@"

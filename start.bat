@@ -13,6 +13,14 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
+:: Auto-install dependencies if anything is missing (also covers requirement changes)
+python -c "import websockets, fastapi, httpx, uvicorn, pyperclip" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [*] Installing dependencies (this only runs when something is missing)...
+    python -m pip install -r requirements.txt
+    echo.
+)
+
 :: Run ShareCV
 python sharecv.py %*
 if %errorlevel% neq 0 (

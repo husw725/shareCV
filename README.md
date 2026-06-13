@@ -1,12 +1,14 @@
 # ShareCV: Cross-Platform Clipboard Sharing
 
-ShareCV is a lightweight tool that synchronizes your clipboard (both text and files) across two computers on the same network. It supports seamless copying on one machine and pasting on another, whether you are using Windows or macOS.
+ShareCV is a lightweight tool that synchronizes your clipboard (both text and files) across multiple computers on the same network. It supports seamless copying on one machine and pasting on another, whether you are using Windows or macOS.
 
 ## Features
 
--   **Automatic Discovery:** No need to type IP addresses. The client automatically finds the server on your local network.
+-   **Automatic Discovery:** No need to type IP addresses. Clients automatically find the server on your local network.
+-   **Instant Push Sync:** Changes are delivered over a WebSocket the moment they happen — low latency, and zero network traffic while idle.
+-   **Multi-Machine:** One machine acts as the hub; any number of others connect to it and stay in sync.
 -   **Text Sharing:** Copy text on one computer, paste it on another.
--   **File Sharing:** Copy files in Finder (macOS) or File Explorer (Windows), and paste them on the other machine.
+-   **File & Image Sharing:** Copy files in Finder (macOS) or File Explorer (Windows), or copy a screenshot, and paste it on another machine. Files are streamed and content-addressed (de-duplicated by hash).
 -   **Cross-Platform:** Works bi-directionally between macOS and Windows.
 -   **Local Server:** Runs entirely on your local network for privacy and speed.
 
@@ -69,9 +71,13 @@ python sharecv.py
 
 ## Technical Details
 
--   **Auto-Discovery:** Uses UDP broadcasting on port `6098` to allow the client to find the server's IP automatically.
--   **Server Mode (`sharecv.py`):** Uses `FastAPI` to handle HTTP requests. It manages the central clipboard state and stores transferred files in a `sharecv_downloads/` directory.
--   **Client Mode (`sharecv.py`):** Polls the server for changes and pushes local clipboard updates.
--   **File Handling:**
-    -   **macOS:** Uses `osascript` (AppleScript) to read/write file paths to the system clipboard.
-    -   **Windows:** Uses PowerShell (`Get-Clipboard`, `Set-Clipboard`) to interact with the file clipboard.
+-   **Auto-Discovery:** Uses UDP broadcast + multicast on port `6098` so clients find the server's IP automatically. A last-known-good server is cached as a fallback.
+-   **Server Mode (hub):** A `FastAPI` app on port `6097` holds the authoritative clipboard state (versioned, content-addressed by SHA-256) and pushes updates to all connected clients over a WebSocket (`/ws`). Files are stored in a content-addressed store under the downloads directory and served streamed via `/file/{hash}`. The hub also participates in sync like any client.
+-   **Client Mode:** Connects to the hub's WebSocket, applies incoming changes, and pushes local clipboard changes instantly. Reconnects automatically if the connection drops.
+-   **Echo prevention:** Each node tracks the signature of what it last saw/applied, so synced content is never bounced back around the network.
+-   **Clipboard Handling (`ClipboardBackend`):**
+    -   **macOS:** Pure AppKit (`NSPasteboard`) — reads/writes file URLs and images directly, with `changeCount()` used to skip redundant work.
+    -   **Windows:** PowerShell (`Get-Clipboard` / `Set-Clipboard`, with file paths passed via environment variables — no string interpolation).
+    -   **Other:** Text-only fallback via `pyperclip`.
+
+> **macOS dependency:** file/image clipboard support requires `pyobjc-framework-Cocoa` (installed automatically by `requirements.txt` on macOS). Without it, ShareCV degrades gracefully to text-only.
