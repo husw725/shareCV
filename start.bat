@@ -16,7 +16,7 @@ if %errorlevel% neq 0 (
 :: Auto-install dependencies if anything is missing (also covers requirement changes)
 python -c "import websockets, fastapi, httpx, uvicorn, pyperclip" >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [*] Installing dependencies (this only runs when something is missing)...
+    echo [*] Installing missing dependencies, please wait...
     python -m pip install -r requirements.txt
     echo.
 )
