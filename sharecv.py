@@ -16,9 +16,9 @@ Architecture (full rewrite):
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
-import queue
 import shutil
 import socket
 import subprocess
@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -42,12 +43,26 @@ from websockets.exceptions import ConnectionClosed
 DISCOVERY_PORT = 6098
 SERVER_PORT = 6097
 DISCOVERY_MESSAGE = b"ShareCV-Server:6097"
+PROBE_MESSAGE = b"ShareCV-Probe"
 MULTICAST_GROUP = "239.255.255.250"
 POLL_INTERVAL = 1.0          # local clipboard poll cadence (seconds)
 RECONNECT_DELAY = 2.0        # client reconnect backoff (seconds)
 CHUNK_SIZE = 1 << 20         # 1 MiB streaming chunks
+MAX_UPLOAD = 4 << 30         # reject uploads beyond 4 GiB
+CLEANUP_DAYS = 7             # purge store/download files older than this at startup
 IMAGE_EXTS = {"png", "jpg", "jpeg", "tiff", "gif", "bmp"}
 CACHE_FILE = ".sharecv_cache"
+
+# Shared secret for auth. Set via --token / SHARECV_TOKEN; empty = open (warned).
+TOKEN = os.environ.get("SHARECV_TOKEN", "")
+
+
+def token_ok(supplied: str) -> bool:
+    return not TOKEN or hmac.compare_digest(supplied or "", TOKEN)
+
+
+def auth_headers() -> dict:
+    return {"X-ShareCV-Token": TOKEN} if TOKEN else {}
 
 if sys.platform == "darwin":
     # /tmp keeps files reachable for sandboxed apps (DingTalk, WeChat) that read lazily.
@@ -82,30 +97,45 @@ def is_hex_hash(value: str) -> bool:
 # ================= CLIPBOARD ITEM =================
 @dataclass
 class ClipItem:
-    """A unit of clipboard content. `hash` identifies the content; for files,
-    `path` is the local filesystem location and `name` the original basename."""
+    """A unit of clipboard content. Text is identified by `hash`; a file item
+    carries one or more entries, each a dict {"path", "name", "hash"} where
+    `path` is the local filesystem location (empty until materialized)."""
     type: str               # "text" | "file"
     text: str = ""
-    path: str = ""
-    name: str = ""
-    hash: str = ""
+    hash: str = ""          # text content hash (unused for files)
+    files: list = field(default_factory=list)
 
     def signature(self) -> tuple:
-        """Identity used for change detection (independent of local path)."""
-        return (self.type, self.hash)
+        """Identity used for change detection (independent of local paths)."""
+        if self.type == "file":
+            return ("file", tuple(f["hash"] for f in self.files))
+        return ("text", self.hash)
+
+    def label(self) -> str:
+        if self.type == "file":
+            return ", ".join(f["name"] for f in self.files)
+        return repr(self.text[:50])
 
     def to_wire(self) -> dict:
         if self.type == "text":
             return {"type": "text", "text": self.text, "hash": self.hash}
-        return {"type": "file", "name": self.name, "hash": self.hash}
+        return {"type": "file",
+                "files": [{"name": f["name"], "hash": f["hash"]} for f in self.files]}
 
     @staticmethod
     def from_wire(d: dict) -> "ClipItem":
         if d.get("type") == "file":
-            return ClipItem(type="file", name=os.path.basename(d.get("name", "") or "file"),
-                            hash=d.get("hash", ""))
+            files = [{"path": "",
+                      "name": os.path.basename(f.get("name") or "") or "file",
+                      "hash": f.get("hash", "")}
+                     for f in d.get("files", [])]
+            return ClipItem(type="file", files=files)
         text = d.get("text", "") or ""
         return ClipItem(type="text", text=text, hash=d.get("hash") or hash_text(text))
+
+
+def file_entry(path: str) -> dict:
+    return {"path": path, "name": os.path.basename(path), "hash": hash_file(path)}
 
 
 # ================= CLIPBOARD BACKENDS =================
@@ -147,7 +177,7 @@ class MacClipboard(ClipboardBackend):
         "from AppKit import NSPasteboard, NSURL\n"
         "pb = NSPasteboard.generalPasteboard()\n"
         "pb.clearContents()\n"
-        "pb.writeObjects_([NSURL.fileURLWithPath_(sys.argv[1])])\n"
+        "pb.writeObjects_([NSURL.fileURLWithPath_(p) for p in sys.argv[1:]])\n"
     )
 
     def __init__(self):
@@ -174,11 +204,13 @@ class MacClipboard(ClipboardBackend):
                 [NSURL], {NSPasteboardURLReadingFileURLsOnlyKey: True})
         except Exception:
             urls = None
-        if urls:
-            path = urls[0].path()
-            if path and os.path.exists(path) and os.path.isfile(path):
-                return ClipItem(type="file", path=path, name=os.path.basename(path),
-                                hash=hash_file(path))
+        files = []
+        for url in urls or []:
+            path = url.path()
+            if path and os.path.isfile(path):
+                files.append(file_entry(path))
+        if files:
+            return ClipItem(type="file", files=files)
         return None
 
     def _read_image(self, pb) -> Optional[ClipItem]:
@@ -207,7 +239,8 @@ class MacClipboard(ClipboardBackend):
             os.remove(tmp)
         else:
             os.replace(tmp, final)
-        return ClipItem(type="file", path=final, name=os.path.basename(final), hash=h)
+        return ClipItem(type="file",
+                        files=[{"path": final, "name": os.path.basename(final), "hash": h}])
 
     def _read_text(self) -> ClipItem:
         text = pyperclip.paste() or ""
@@ -222,29 +255,41 @@ class MacClipboard(ClipboardBackend):
             self._cached = item
             return
 
-        path = os.path.abspath(item.path)
-        if not os.path.exists(path):
-            print(f"[!] File to copy not found: {path}")
+        paths = []
+        for f in item.files:
+            path = os.path.abspath(f["path"])
+            if os.path.exists(path):
+                paths.append(path)
+            else:
+                print(f"[!] File to copy not found: {path}")
+        if not paths:
             return
 
-        ext = path.rsplit(".", 1)[-1].lower() if "." in os.path.basename(path) else ""
-        if ext in IMAGE_EXTS:
-            img = NSImage.alloc().initByReferencingFile_(path)
-            if img is not None and img.isValid():
-                pb.clearContents()
-                pb.writeObjects_([img])
-                self._cc = pb.changeCount()
-                self._cached = item
-                return
-        # Non-image files: hand off to a short-lived process (see _URL_WRITER).
-        subprocess.run([sys.executable, "-c", self._URL_WRITER, path], check=False)
+        if len(paths) == 1:
+            path = paths[0]
+            ext = path.rsplit(".", 1)[-1].lower() if "." in os.path.basename(path) else ""
+            if ext in IMAGE_EXTS:
+                img = NSImage.alloc().initByReferencingFile_(path)
+                if img is not None and img.isValid():
+                    pb.clearContents()
+                    pb.writeObjects_([img])
+                    self._cc = pb.changeCount()
+                    self._cached = item
+                    return
+        # Non-image / multiple files: hand off to a short-lived process (see _URL_WRITER).
+        subprocess.run([sys.executable, "-c", self._URL_WRITER, *paths], check=False)
         self._cc = pb.changeCount()
         self._cached = item
 
 
 class WindowsClipboard(ClipboardBackend):
     """Windows backend via PowerShell. File paths are passed through the
-    SHARECV_PATH environment variable, never interpolated into the script."""
+    SHARECV_PATH environment variable (newline-separated), never interpolated
+    into the script.
+
+    Uses GetClipboardSequenceNumber() (the Windows analogue of NSPasteboard's
+    changeCount) as a cheap gate, so the PowerShell subprocess and file hashing
+    only run when the clipboard actually changed."""
 
     _READ = (
         "Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }"
@@ -252,46 +297,75 @@ class WindowsClipboard(ClipboardBackend):
     _WRITE_FILE = (
         "Add-Type -AssemblyName System.Windows.Forms;"
         "Add-Type -AssemblyName System.Drawing;"
-        "$p = $env:SHARECV_PATH;"
+        "$paths = $env:SHARECV_PATH -split \"`n\";"
         "$data = New-Object System.Windows.Forms.DataObject;"
         "$files = New-Object System.Collections.Specialized.StringCollection;"
-        "$files.Add($p) | Out-Null;"
+        "foreach ($p in $paths) { $files.Add($p) | Out-Null };"
         "$data.SetFileDropList($files);"
         "$eff = New-Object byte[] 4; $eff[0] = 5;"
         "$data.SetData('Preferred DropEffect', [System.IO.MemoryStream]::new($eff));"
-        "if (@('.png','.jpg','.jpeg','.bmp','.gif','.tiff') -contains [IO.Path]::GetExtension($p).ToLower()) {"
-        "  try { $bmp = New-Object System.Drawing.Bitmap($p); $data.SetImage($bmp);"
+        "if ($paths.Count -eq 1 -and @('.png','.jpg','.jpeg','.bmp','.gif','.tiff') -contains [IO.Path]::GetExtension($paths[0]).ToLower()) {"
+        "  try { $bmp = New-Object System.Drawing.Bitmap($paths[0]); $data.SetImage($bmp);"
         "        [System.Windows.Forms.Clipboard]::SetDataObject($data, $true); $bmp.Dispose() }"
         "  catch { [System.Windows.Forms.Clipboard]::SetDataObject($data, $true) }"
         "} else { [System.Windows.Forms.Clipboard]::SetDataObject($data, $true) }"
     )
 
+    def __init__(self):
+        import ctypes
+        self._user32 = ctypes.windll.user32
+        self._seq = -1
+        self._cached: Optional[ClipItem] = None
+
     def read(self) -> Optional[ClipItem]:
+        seq = self._user32.GetClipboardSequenceNumber()
+        if seq == self._seq and self._cached is not None:
+            return self._cached
+        self._seq = seq
+        item = self._read_files() or self._read_text()
+        self._cached = item
+        return item
+
+    def _read_files(self) -> Optional[ClipItem]:
         try:
             result = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-Command", self._READ],
                 capture_output=True, text=True, check=False)
             if result.returncode == 0 and result.stdout.strip():
-                path = result.stdout.strip().splitlines()[0].strip()
-                if path and os.path.exists(path) and os.path.isfile(path):
-                    return ClipItem(type="file", path=path, name=os.path.basename(path),
-                                    hash=hash_file(path))
+                files = []
+                for line in result.stdout.strip().splitlines():
+                    path = line.strip()
+                    if path and os.path.isfile(path):
+                        files.append(file_entry(path))
+                if files:
+                    return ClipItem(type="file", files=files)
         except Exception:
             pass
+        return None
+
+    def _read_text(self) -> ClipItem:
         text = pyperclip.paste() or ""
         return ClipItem(type="text", text=text, hash=hash_text(text))
 
     def write(self, item: ClipItem) -> None:
         if item.type == "text":
             pyperclip.copy(item.text)
-            return
-        path = os.path.abspath(item.path)
-        if not os.path.exists(path):
-            print(f"[!] File to copy not found: {path}")
-            return
-        env = dict(os.environ, SHARECV_PATH=path)
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command", self._WRITE_FILE],
-                       env=env, check=False)
+        else:
+            paths = []
+            for f in item.files:
+                path = os.path.abspath(f["path"])
+                if os.path.exists(path):
+                    paths.append(path)
+                else:
+                    print(f"[!] File to copy not found: {path}")
+            if not paths:
+                return
+            env = dict(os.environ, SHARECV_PATH="\n".join(paths))
+            subprocess.run(["powershell.exe", "-NoProfile", "-Command", self._WRITE_FILE],
+                           env=env, check=False)
+        # Baseline the sequence number so our own write isn't re-read as a change.
+        self._seq = self._user32.GetClipboardSequenceNumber()
+        self._cached = item
 
 
 def get_backend() -> ClipboardBackend:
@@ -366,8 +440,20 @@ class ClipboardMonitor(threading.Thread):
 
 
 # ================= NETWORK DISCOVERY =================
-def discover_server(timeout=2.0) -> Optional[str]:
-    """Listen for the server's UDP/multicast announcement."""
+def lan_ip() -> str:
+    """Best-effort LAN IP of this machine (no packets are actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _discovery_socket() -> socket.socket:
+    """UDP socket bound to the discovery port, broadcast+multicast enabled."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     if sys.platform != "win32":
@@ -375,20 +461,56 @@ def discover_server(timeout=2.0) -> Optional[str]:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
             pass
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    sock.bind(("", DISCOVERY_PORT))
     try:
-        sock.bind(("", DISCOVERY_PORT))
+        mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    except OSError:
+        pass
+    return sock
+
+
+def _send_everywhere(sock: socket.socket, msg: bytes):
+    """Fire msg at every reachable path: broadcast, multicast, subnet-directed."""
+    for target in ("<broadcast>", MULTICAST_GROUP):
         try:
-            mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        except OSError:
+            sock.sendto(msg, (target, DISCOVERY_PORT))
+        except Exception:
             pass
-        sock.settimeout(timeout)
-        data, addr = sock.recvfrom(1024)
-        if data == DISCOVERY_MESSAGE:
-            port = data.decode().split(":")[1]
-            url = f"http://{addr[0]}:{port}"
-            print(f"[+] Found server at {url}")
-            return url
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip.startswith("127."):
+                continue
+            subnet = ".".join(ip.split(".")[:-1]) + ".255"
+            sock.sendto(msg, (subnet, DISCOVERY_PORT))
+    except Exception:
+        pass
+
+
+def discover_server(attempts=5, timeout=1.0) -> Optional[str]:
+    """Actively probe for a server and listen for its reply/announcement."""
+    try:
+        sock = _discovery_socket()
+    except Exception:
+        return None
+    try:
+        for _ in range(attempts):
+            _send_everywhere(sock, PROBE_MESSAGE)
+            deadline = time.monotonic() + timeout
+            while (remaining := deadline - time.monotonic()) > 0:
+                sock.settimeout(remaining)
+                try:
+                    data, addr = sock.recvfrom(1024)
+                except socket.timeout:
+                    break
+                if data == DISCOVERY_MESSAGE:
+                    port = data.decode().split(":")[1]
+                    url = f"http://{addr[0]}:{port}"
+                    print(f"[+] Found server at {url}")
+                    return url
+                # ignore our own probe echoing back off the broadcast
     except Exception:
         pass
     finally:
@@ -397,26 +519,29 @@ def discover_server(timeout=2.0) -> Optional[str]:
 
 
 def udp_broadcaster(stop: threading.Event):
-    """Announce server presence for client auto-discovery."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    """Announce server presence and answer client probes with a unicast reply."""
+    try:
+        sock = _discovery_socket()
+    except Exception as e:
+        print(f"[!] Discovery responder failed to start: {e}")
+        return
     print(f"[*] Discovery broadcaster started on port {DISCOVERY_PORT}")
     while not stop.is_set():
-        try:
-            sock.sendto(DISCOVERY_MESSAGE, ("<broadcast>", DISCOVERY_PORT))
-            sock.sendto(DISCOVERY_MESSAGE, (MULTICAST_GROUP, DISCOVERY_PORT))
+        _send_everywhere(sock, DISCOVERY_MESSAGE)
+        deadline = time.monotonic() + 1.0
+        while not stop.is_set() and (remaining := deadline - time.monotonic()) > 0:
+            sock.settimeout(remaining)
             try:
-                for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-                    if ip.startswith("127."):
-                        continue
-                    subnet = ".".join(ip.split(".")[:-1]) + ".255"
-                    sock.sendto(DISCOVERY_MESSAGE, (subnet, DISCOVERY_PORT))
+                data, addr = sock.recvfrom(1024)
+            except socket.timeout:
+                break
             except Exception:
-                pass
-        except Exception:
-            pass
-        stop.wait(1.0)
+                break
+            if data == PROBE_MESSAGE:
+                try:
+                    sock.sendto(DISCOVERY_MESSAGE, addr)
+                except Exception:
+                    pass
     sock.close()
 
 
@@ -442,24 +567,45 @@ def store_path(file_hash: str) -> str:
 
 
 def ingest_local_file(item: ClipItem) -> None:
-    """Copy a locally-originated file into the content-addressed store."""
-    dest = store_path(item.hash)
-    if not os.path.exists(dest) and os.path.exists(item.path):
-        tmp = dest + ".part"
-        shutil.copy2(item.path, tmp)
-        os.replace(tmp, dest)
+    """Copy locally-originated files into the content-addressed store."""
+    for f in item.files:
+        dest = store_path(f["hash"])
+        if not os.path.exists(dest) and os.path.exists(f["path"]):
+            tmp = dest + ".part"
+            shutil.copy2(f["path"], tmp)
+            os.replace(tmp, dest)
 
 
-def materialize(item: ClipItem) -> Optional[str]:
-    """Produce a real, well-named file path from a stored item so it can be
-    placed on the clipboard. Returns None if the content isn't in the store."""
-    src = store_path(item.hash)
-    if not os.path.exists(src):
-        return None
-    dest = os.path.join(DOWNLOAD_DIR, os.path.basename(item.name) or item.hash)
-    if not (os.path.exists(dest) and hash_file(dest) == item.hash):
-        shutil.copy2(src, dest)
-    return dest
+def materialize(item: ClipItem) -> Optional[ClipItem]:
+    """Produce real, well-named file paths from stored content so the item can
+    be placed on the clipboard. Returns None if any file isn't in the store."""
+    files = []
+    for f in item.files:
+        src = store_path(f["hash"])
+        if not os.path.exists(src):
+            return None
+        dest = os.path.join(DOWNLOAD_DIR, os.path.basename(f["name"]) or f["hash"])
+        if os.path.exists(dest) and hash_file(dest) != f["hash"]:
+            # Same basename, different content (e.g. two files named a.txt in
+            # one batch) -- de-conflict with a hash prefix.
+            dest = os.path.join(DOWNLOAD_DIR, f"{f['hash'][:8]}_{os.path.basename(f['name'])}")
+        if not (os.path.exists(dest) and hash_file(dest) == f["hash"]):
+            shutil.copy2(src, dest)
+        files.append({"path": dest, "name": f["name"], "hash": f["hash"]})
+    return ClipItem(type="file", files=files)
+
+
+def cleanup_old_files(days: float = CLEANUP_DAYS) -> None:
+    """Purge store/download files untouched for `days` (run once at startup)."""
+    cutoff = time.time() - days * 86400
+    for d in (STORE_DIR, DOWNLOAD_DIR):
+        for name in os.listdir(d):
+            path = os.path.join(d, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
 
 
 # ================= SERVER (HUB) =================
@@ -486,16 +632,12 @@ class Hub:
 
     async def _broadcast(self, payload: dict, exclude: Optional[WebSocket] = None):
         msg = json.dumps(payload)
-        dead = []
-        for ws in list(self.conns):
-            if ws is exclude:
-                continue
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.unregister(ws)
+        conns = [ws for ws in list(self.conns) if ws is not exclude]
+        results = await asyncio.gather(*(ws.send_text(msg) for ws in conns),
+                                       return_exceptions=True)
+        for ws, res in zip(conns, results):
+            if isinstance(res, BaseException):
+                self.unregister(ws)
 
     async def publish(self, item: ClipItem, origin: str, exclude: Optional[WebSocket] = None,
                       apply_local: bool = True):
@@ -507,7 +649,7 @@ class Hub:
             self.version += 1
             self.item = item
             version = self.version
-        print(f"[hub] v{version} <- {origin}: {item.type} {item.name or item.text[:40]!r}")
+        print(f"[hub] v{version} <- {origin}: {item.type} {item.label()}")
         await self._broadcast({
             "kind": "update", "version": version, "origin": origin,
             "item": item.to_wire(),
@@ -517,15 +659,37 @@ class Hub:
 
     async def _apply_local(self, item: ClipItem):
         if item.type == "file":
-            path = await asyncio.to_thread(materialize, item)
-            if path is None:
+            item = await asyncio.to_thread(materialize, item)
+            if item is None:
                 return
-            item = ClipItem(type="file", path=path, name=item.name, hash=item.hash)
         await asyncio.to_thread(self.local.apply, item)
 
 
 hub = Hub()
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    hub.loop = asyncio.get_running_loop()
+    hub.local = LocalClipboard(get_backend())
+    hub.local.prime()
+    cleanup_old_files()
+
+    def on_change(item: ClipItem):
+        if item.type == "file":
+            ingest_local_file(item)
+        # Hand the change to the event loop; don't apply_local (it's already here).
+        asyncio.run_coroutine_threadsafe(
+            hub.publish(item, origin=NODE_ID, apply_local=False), hub.loop)
+
+    monitor = ClipboardMonitor(hub.local, on_change)
+    monitor.start()
+    print(f"[+] Server ready: http://{lan_ip()}:{SERVER_PORT}")
+    yield
+    monitor.stop()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
@@ -535,20 +699,39 @@ async def health():
 
 @app.post("/upload/{file_hash}")
 async def upload(file_hash: str, request: Request):
+    if not token_ok(request.headers.get("x-sharecv-token", "")):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     if not is_hex_hash(file_hash):
         return JSONResponse({"error": "bad hash"}, status_code=400)
     dest = store_path(file_hash)
-    if not os.path.exists(dest):
-        tmp = dest + f".{uuid.uuid4().hex}.part"
+    if os.path.exists(dest):
+        return {"status": "ok", "hash": file_hash}
+    tmp = dest + f".{uuid.uuid4().hex}.part"
+    hasher = hashlib.sha256()
+    size = 0
+    try:
         with open(tmp, "wb") as f:
             async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_UPLOAD:
+                    return JSONResponse({"error": "too large"}, status_code=413)
+                hasher.update(chunk)
                 f.write(chunk)
+        # Content must actually match the hash it claims to be -- otherwise anyone
+        # could poison the content-addressed store.
+        if hasher.hexdigest() != file_hash:
+            return JSONResponse({"error": "hash mismatch"}, status_code=400)
         os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return {"status": "ok", "hash": file_hash}
 
 
 @app.get("/file/{file_hash}")
-async def download(file_hash: str, name: str = "file"):
+async def download(file_hash: str, request: Request, name: str = "file"):
+    if not token_ok(request.headers.get("x-sharecv-token", "")):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     if not is_hex_hash(file_hash):
         return JSONResponse({"error": "bad hash"}, status_code=400)
     path = store_path(file_hash)
@@ -564,6 +747,10 @@ async def ws_endpoint(ws: WebSocket):
     try:
         hello = json.loads(await ws.receive_text())
         node_id = hello.get("node_id", "unknown")
+        if not token_ok(hello.get("token", "")):
+            print(f"[hub] rejected client {node_id}: bad token")
+            await ws.close(code=4401)
+            return
         await hub.register(ws, node_id)
         print(f"[hub] client connected: {node_id} ({len(hub.conns)} total)")
         while True:
@@ -580,47 +767,23 @@ async def ws_endpoint(ws: WebSocket):
         print(f"[hub] client disconnected: {node_id} ({len(hub.conns)} total)")
 
 
-@app.on_event("startup")
-async def on_startup():
-    hub.loop = asyncio.get_running_loop()
-    hub.local = LocalClipboard(get_backend())
-    hub.local.prime()
-
-    def on_change(item: ClipItem):
-        if item.type == "file":
-            ingest_local_file(item)
-        # Hand the change to the event loop; don't apply_local (it's already here).
-        asyncio.run_coroutine_threadsafe(
-            hub.publish(item, origin=NODE_ID, apply_local=False), hub.loop)
-
-    monitor = ClipboardMonitor(hub.local, on_change)
-    monitor.start()
-    app.state.monitor = monitor
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    mon = getattr(app.state, "monitor", None)
-    if mon:
-        mon.stop()
-
-
 # ================= CLIENT =================
-async def fetch_file(client: httpx.AsyncClient, server_url: str, item: ClipItem) -> bool:
-    """Ensure item's content is in the local store, downloading if needed."""
-    dest = store_path(item.hash)
+async def fetch_file(client: httpx.AsyncClient, server_url: str, f: dict) -> bool:
+    """Ensure one file entry's content is in the local store, downloading if needed."""
+    dest = store_path(f["hash"])
     if os.path.exists(dest):
         return True
-    url = f"{server_url}/file/{item.hash}"
+    url = f"{server_url}/file/{f['hash']}"
     tmp = dest + f".{uuid.uuid4().hex}.part"
     try:
-        async with client.stream("GET", url, params={"name": item.name}) as resp:
+        async with client.stream("GET", url, params={"name": f["name"]},
+                                 headers=auth_headers()) as resp:
             if resp.status_code != 200:
                 print(f"[!] Download failed: HTTP {resp.status_code}")
                 return False
-            with open(tmp, "wb") as f:
+            with open(tmp, "wb") as fh:
                 async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                    f.write(chunk)
+                    fh.write(chunk)
         os.replace(tmp, dest)
         return True
     except Exception as e:
@@ -630,21 +793,23 @@ async def fetch_file(client: httpx.AsyncClient, server_url: str, item: ClipItem)
         return False
 
 
-async def push_file(client: httpx.AsyncClient, server_url: str, item: ClipItem):
-    """Upload a locally-copied file to the hub (streamed)."""
+async def push_files(client: httpx.AsyncClient, server_url: str, item: ClipItem):
+    """Upload locally-copied files to the hub (streamed, one request per file)."""
     ingest_local_file(item)
-    src = store_path(item.hash)
+    for f in item.files:
+        src = store_path(f["hash"])
 
-    async def gen():
-        # httpx AsyncClient needs an async body; offload blocking reads to a thread.
-        with open(src, "rb") as f:
-            while True:
-                chunk = await asyncio.to_thread(f.read, CHUNK_SIZE)
-                if not chunk:
-                    break
-                yield chunk
+        async def gen(path=src):
+            # httpx AsyncClient needs an async body; offload blocking reads to a thread.
+            with open(path, "rb") as fh:
+                while True:
+                    chunk = await asyncio.to_thread(fh.read, CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    yield chunk
 
-    await client.post(f"{server_url}/upload/{item.hash}", content=gen(), timeout=None)
+        await client.post(f"{server_url}/upload/{f['hash']}", content=gen(),
+                          headers=auth_headers(), timeout=None)
 
 
 async def recv_loop(ws, client, server_url, local: LocalClipboard, seen: dict):
@@ -659,17 +824,18 @@ async def recv_loop(ws, client, server_url, local: LocalClipboard, seen: dict):
         seen["version"] = version
         item = ClipItem.from_wire(msg.get("item", {}))
         if item.type == "file":
-            if not item.hash:
+            if not item.files or not all(f["hash"] for f in item.files):
                 continue
-            if not await fetch_file(client, server_url, item):
+            fetched = await asyncio.gather(
+                *(fetch_file(client, server_url, f) for f in item.files))
+            if not all(fetched):
                 continue
-            path = await asyncio.to_thread(materialize, item)
-            if path is None:
+            item = await asyncio.to_thread(materialize, item)
+            if item is None:
                 continue
-            item = ClipItem(type="file", path=path, name=item.name, hash=item.hash)
-            print(f"[v{version}] received file: {item.name}")
+            print(f"[v{version}] received files: {item.label()}")
         else:
-            print(f"[v{version}] received text: {item.text[:50]!r}")
+            print(f"[v{version}] received text: {item.label()}")
         await asyncio.to_thread(local.apply, item)
 
 
@@ -678,10 +844,10 @@ async def send_loop(ws, client, server_url, outq: asyncio.Queue):
         item: ClipItem = await outq.get()
         try:
             if item.type == "file":
-                print(f"[^] sending file: {item.name}")
-                await push_file(client, server_url, item)
+                print(f"[^] sending files: {item.label()}")
+                await push_files(client, server_url, item)
             else:
-                print(f"[^] sending text: {item.text[:50]!r}")
+                print(f"[^] sending text: {item.label()}")
             await ws.send(json.dumps({
                 "kind": "update", "origin": NODE_ID, "item": item.to_wire(),
             }))
@@ -693,6 +859,7 @@ async def run_client(server_url: str):
     backend = get_backend()
     local = LocalClipboard(backend)
     local.prime()
+    cleanup_old_files()
     ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
     loop = asyncio.get_running_loop()
 
@@ -701,7 +868,8 @@ async def run_client(server_url: str):
             monitor = None
             try:
                 async with ws_connect(ws_url, max_size=None) as ws:
-                    await ws.send(json.dumps({"kind": "hello", "node_id": NODE_ID}))
+                    await ws.send(json.dumps(
+                        {"kind": "hello", "node_id": NODE_ID, "token": TOKEN}))
                     print(f"[+] Connected to {server_url} (node {NODE_ID}). Ctrl+C to stop.")
                     save_cache(server_url)
                     seen = {"version": 0}
@@ -729,6 +897,9 @@ async def run_client(server_url: str):
                         # Drain both tasks so no "Task exception was never retrieved" noise.
                         await asyncio.gather(*tasks, return_exceptions=True)
             except (ConnectionClosed, OSError, ConnectionError) as e:
+                if isinstance(e, ConnectionClosed) and e.rcvd is not None and e.rcvd.code == 4401:
+                    print("[!] Server rejected our token. Set the right one via --token / SHARECV_TOKEN.")
+                    return
                 print(f"[!] Connection lost ({type(e).__name__}: {e}); reconnecting in {RECONNECT_DELAY}s...")
             except Exception as e:
                 print(f"[!] Client error: {type(e).__name__}: {e}; reconnecting in {RECONNECT_DELAY}s...")
@@ -744,15 +915,27 @@ def main():
         description="ShareCV - Cross-platform clipboard synchronization")
     parser.add_argument("server", nargs="?", default=None,
                         help="Server IP or URL to connect to directly (skips auto-discovery)")
+    parser.add_argument("--token", default=os.environ.get("SHARECV_TOKEN", ""),
+                        help="Shared secret; must match on all nodes (env: SHARECV_TOKEN)")
+    parser.add_argument("--mode", choices=("auto", "server", "client"), default="auto",
+                        help="auto: discover, else become server; server/client: force the role")
     args = parser.parse_args()
+
+    global TOKEN
+    TOKEN = args.token
+    if not TOKEN:
+        print("[!] WARNING: no --token set -- anyone on this network can read/write "
+              "your clipboard. Set the same --token on every node.")
 
     server_url = None
     if args.server:
+        if args.mode == "server":
+            parser.error("--mode server cannot be combined with a server address")
         server_url = args.server if args.server.startswith("http") else f"http://{args.server}:{SERVER_PORT}"
         print(f"[+] Manual server URL: {server_url}")
-    else:
+    elif args.mode != "server":
         print("[*] Looking for an existing ShareCV server on the local network...")
-        server_url = discover_server(timeout=2.0)
+        server_url = discover_server()
         if not server_url:
             cached = load_cache()
             if cached:
@@ -763,6 +946,10 @@ def main():
                         server_url = cached
                 except Exception:
                     pass
+        if not server_url and args.mode == "client":
+            print("[!] No server found and --mode client forbids becoming one. "
+                  "Start the server first, or pass its IP: python sharecv.py <server-ip>")
+            sys.exit(1)
 
     if server_url:
         print(f"[+] CLIENT mode -> {server_url}")
@@ -771,7 +958,11 @@ def main():
         except KeyboardInterrupt:
             print("\n[*] Stopped clipboard sync.")
     else:
-        print("[+] No server found. Starting in SERVER mode (hub).")
+        print("[+] Starting in SERVER mode (hub)." if args.mode == "server"
+              else "[+] No server found. Starting in SERVER mode (hub).")
+        print(f"[i] If the other machine ALSO ends up in SERVER mode, discovery is being "
+              f"blocked (firewall / AP isolation). Connect it manually:\n"
+              f"    python sharecv.py {lan_ip()}" + (" --token <your-token>" if TOKEN else ""))
         stop = threading.Event()
         threading.Thread(target=udp_broadcaster, args=(stop,), daemon=True).start()
         try:
