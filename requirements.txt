@@ -1,5 +1,6 @@
 fastapi==0.115.0
 httpx==0.27.2
+psutil>=5.9          # per-interface addresses, so VPN/proxy TUN adapters can be skipped
 pyperclip==1.9.0
 uvicorn==0.30.0
 websockets>=12.0

@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import shutil
@@ -39,6 +40,11 @@ from fastapi import WebSocket, WebSocketDisconnect
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
 
+try:                      # optional: gives per-interface addresses + netmasks
+    import psutil
+except ImportError:       # pragma: no cover - degraded interface enumeration
+    psutil = None
+
 # ================= CONFIG =================
 DISCOVERY_PORT = 6098
 SERVER_PORT = 6097
@@ -55,6 +61,9 @@ CACHE_FILE = ".sharecv_cache"
 
 # Shared secret for auth. Set via --token / SHARECV_TOKEN; empty = open (warned).
 TOKEN = os.environ.get("SHARECV_TOKEN", "")
+
+# Pin the advertised LAN address. Set via --ip / SHARECV_IP; empty = auto-detect.
+LAN_IP_PIN = os.environ.get("SHARECV_IP", "")
 
 
 def token_ok(supplied: str) -> bool:
@@ -440,16 +449,149 @@ class ClipboardMonitor(threading.Thread):
 
 
 # ================= NETWORK DISCOVERY =================
-def lan_ip() -> str:
-    """Best-effort LAN IP of this machine (no packets are actually sent)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+# Why we don't use the classic "connect a UDP socket to 8.8.8.8 and read back the
+# source address" trick: proxy clients running in TUN mode (XiGua / Clash / Mihomo /
+# Surge...) install a default route through a virtual adapter, so that trick reports
+# the tunnel address -- typically in 198.18.0.0/15, the RFC 2544 benchmarking range
+# Clash-family cores use for their TUN gateway and fake-ip pool. That happens in rule
+# mode just as much as in global mode: the routing table always points at the TUN and
+# only the rule engine downstream decides proxy-vs-direct. So we enumerate every
+# interface and score them instead, which keeps ShareCV on the real LAN address.
+
+# Ranges that are never a usable LAN address for us.
+_BAD_NETS = (ipaddress.ip_network("198.18.0.0/15"),)   # RFC 2544 / Clash-family TUN
+# Ranges that work but are almost certainly not the LAN we want.
+_MEH_NETS = (ipaddress.ip_network("100.64.0.0/10"),)   # CGNAT / Tailscale
+
+_VIRTUAL_IF_HINTS = ("tun", "tap", "utun", "wg", "tailscale", "zerotier", "docker",
+                     "veth", "wsl", "hyper-v", "vmware", "virtualbox", "vmnet",
+                     "loopback", "pseudo", "xigua", "clash", "warp", "ppp", "bridge")
+_PHYSICAL_IF_PREFIXES = ("en", "eth", "wlan", "wl", "wi-fi", "wifi",
+                         "以太网", "无线", "本地连接")
+
+_if_cache: tuple = (0.0, [])   # (monotonic_stamp, [(name, ip, netmask)])
+
+
+def _raw_interface_addrs() -> list:
+    """[(ifname, ip, netmask)] for every up IPv4 interface. Best effort per platform."""
+    out = []
+    if psutil is not None:
+        try:
+            stats = psutil.net_if_stats()
+            for name, addrs in psutil.net_if_addrs().items():
+                st = stats.get(name)
+                if st is not None and not st.isup:
+                    continue
+                for a in addrs:
+                    if a.family == socket.AF_INET and a.address:
+                        out.append((name, a.address, a.netmask or "255.255.255.0"))
+            if out:
+                return out
+        except Exception:
+            pass
+    try:                                    # works on Windows, spotty elsewhere
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            out.append(("", ip, "255.255.255.0"))
     except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        pass
+    if not out and sys.platform == "darwin":
+        for dev in ("en0", "en1", "en2"):
+            try:
+                ip = subprocess.run(["ipconfig", "getifaddr", dev], capture_output=True,
+                                    text=True, timeout=2).stdout.strip()
+            except Exception:
+                continue
+            if ip:
+                out.append((dev, ip, "255.255.255.0"))
+    if not out:                             # last resort: may well be the TUN address
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            out.append(("", s.getsockname()[0], "255.255.255.0"))
+        except Exception:
+            pass
+        finally:
+            s.close()
+    return out
+
+
+def _score_addr(name: str, ip: str, netmask: str) -> int:
+    """Rank a local address as "the LAN address a peer should dial". <0 = unusable."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        prefixlen = ipaddress.IPv4Network(f"0.0.0.0/{netmask}").prefixlen
+    except ValueError:
+        return -1
+    if addr.is_loopback or addr.is_link_local or addr.is_multicast or addr.is_unspecified:
+        return -1
+    if any(addr in net for net in _BAD_NETS):
+        return -1
+    low = name.lower()
+    score = 100
+    if any(h in low for h in _VIRTUAL_IF_HINTS):
+        score -= 60
+    if low.startswith(_PHYSICAL_IF_PREFIXES):
+        score += 20
+    if prefixlen >= 30:            # /30 or /31 is a point-to-point tunnel, not a LAN
+        score -= 50
+    if any(addr in net for net in _MEH_NETS):
+        score -= 50
+    elif addr in ipaddress.ip_network("192.168.0.0/16"):
+        score += 10
+    elif addr in ipaddress.ip_network("10.0.0.0/8"):
+        score += 8
+    elif addr in ipaddress.ip_network("172.16.0.0/12"):
+        score += 4                 # frequently Docker/WSL, so a weaker bonus
+    elif not addr.is_private:
+        score -= 30                # a public address on the box isn't the LAN path
+    return score
+
+
+def lan_interfaces(max_age: float = 5.0) -> list:
+    """Usable local IPv4 interfaces as [(score, name, ip, netmask)], best first."""
+    global _if_cache
+    now = time.monotonic()
+    if now - _if_cache[0] > max_age:
+        scored = [(s, n, ip, m) for n, ip, m in _raw_interface_addrs()
+                  if (s := _score_addr(n, ip, m)) >= 0]
+        scored.sort(key=lambda t: -t[0])
+        _if_cache = (now, scored)
+    return _if_cache[1]
+
+
+def lan_ip() -> str:
+    """LAN address of this machine, ignoring proxy/VPN tunnel adapters."""
+    if LAN_IP_PIN:
+        return LAN_IP_PIN
+    ifaces = lan_interfaces()
+    return ifaces[0][2] if ifaces else "127.0.0.1"
+
+
+def describe_interfaces() -> str:
+    ifaces = lan_interfaces()
+    if not ifaces:
+        return "    (none detected)"
+    return "\n".join(f"    {ip}/{ipaddress.IPv4Network(f'0.0.0.0/{m}').prefixlen}"
+                     f"  {name or '?'}  (score {s})" for s, name, ip, m in ifaces)
+
+
+def _broadcast_targets() -> list:
+    """Subnet-directed broadcast addresses, one per usable interface.
+
+    Subnet-directed (10.20.1.255) rather than 255.255.255.255 on purpose: the former
+    matches the on-link route of the real NIC, so it leaves via that NIC even when a
+    TUN adapter owns the default route -- which is exactly where 255.255.255.255 goes
+    and gets swallowed by the proxy.
+    """
+    targets = []
+    for _s, _n, ip, mask in lan_interfaces():
+        try:
+            bcast = str(ipaddress.IPv4Interface(f"{ip}/{mask}").network.broadcast_address)
+        except ValueError:
+            continue
+        if bcast not in targets:
+            targets.append(bcast)
+    return targets
 
 
 def _discovery_socket() -> socket.socket:
@@ -464,27 +606,40 @@ def _discovery_socket() -> socket.socket:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
     sock.bind(("", DISCOVERY_PORT))
-    try:
-        mreq = socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0")
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-    except OSError:
-        pass
+    # Join on every real interface, not just the default-route one (the TUN).
+    joined = False
+    for _s, _n, ip, _m in lan_interfaces():
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                            socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton(ip))
+            joined = True
+        except OSError:
+            pass
+    if not joined:
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                            socket.inet_aton(MULTICAST_GROUP) + socket.inet_aton("0.0.0.0"))
+        except OSError:
+            pass
     return sock
 
 
 def _send_everywhere(sock: socket.socket, msg: bytes):
-    """Fire msg at every reachable path: broadcast, multicast, subnet-directed."""
-    for target in ("<broadcast>", MULTICAST_GROUP):
+    """Fire msg at every reachable path: per-interface broadcast + multicast."""
+    for bcast in _broadcast_targets():
         try:
-            sock.sendto(msg, (target, DISCOVERY_PORT))
+            sock.sendto(msg, (bcast, DISCOVERY_PORT))
         except Exception:
             pass
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if ip.startswith("127."):
-                continue
-            subnet = ".".join(ip.split(".")[:-1]) + ".255"
-            sock.sendto(msg, (subnet, DISCOVERY_PORT))
+    for _s, _n, ip, _m in lan_interfaces():
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                            socket.inet_aton(ip))
+            sock.sendto(msg, (MULTICAST_GROUP, DISCOVERY_PORT))
+        except Exception:
+            pass
+    try:                                    # also try the default route, harmless
+        sock.sendto(msg, ("<broadcast>", DISCOVERY_PORT))
     except Exception:
         pass
 
@@ -919,10 +1074,14 @@ def main():
                         help="Shared secret; must match on all nodes (env: SHARECV_TOKEN)")
     parser.add_argument("--mode", choices=("auto", "server", "client"), default="auto",
                         help="auto: discover, else become server; server/client: force the role")
+    parser.add_argument("--ip", default=os.environ.get("SHARECV_IP", ""),
+                        help="Pin the LAN address to advertise, bypassing auto-detection "
+                             "(env: SHARECV_IP). Useful if a VPN/proxy TUN adapter confuses it")
     args = parser.parse_args()
 
-    global TOKEN
+    global TOKEN, LAN_IP_PIN
     TOKEN = args.token
+    LAN_IP_PIN = args.ip
     if not TOKEN:
         print("[!] WARNING: no --token set -- anyone on this network can read/write "
               "your clipboard. Set the same --token on every node.")
@@ -960,6 +1119,12 @@ def main():
     else:
         print("[+] Starting in SERVER mode (hub)." if args.mode == "server"
               else "[+] No server found. Starting in SERVER mode (hub).")
+        if LAN_IP_PIN:
+            print(f"[i] LAN address pinned to {LAN_IP_PIN}")
+        else:
+            print(f"[i] Candidate LAN addresses (tunnel adapters excluded):\n"
+                  f"{describe_interfaces()}\n"
+                  f"[i] Picked {lan_ip()} -- override with --ip if that's wrong.")
         print(f"[i] If the other machine ALSO ends up in SERVER mode, discovery is being "
               f"blocked (firewall / AP isolation). Connect it manually:\n"
               f"    python sharecv.py {lan_ip()}" + (" --token <your-token>" if TOKEN else ""))
